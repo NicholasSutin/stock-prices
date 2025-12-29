@@ -6,6 +6,7 @@ API Providers (optimized for free tier)
 - This is meant for eventual deployment on cloudflare, with opennext (nextjs) as the framework
 - Priority is ensuring every visitor doesn't call finnhub directly
     - visitors should still get relatively recent data across 10 tickers (used in this example)
+- optimized to be as low-cost as possible (free cloudflare services, free, though limited API usage)
 ---
 # goal:
 - send 10 stock tickers to get data from in 1 call
@@ -14,10 +15,10 @@ API Providers (optimized for free tier)
 - read from cloudflare worker
 - consider Durable Objects and Workflows
 ---
-created with ``pnpm create cloudflare@latest . --framework=next``
-Massive install ``pnpm install --save '@massive.com/client-js'`` (didn't work)
-- retried with ``pnpm add @massive.com/client-js``
-    - build script warning left unfixed (do not select anything from) ``pnpm approve-builds`` yet
+- created with ``pnpm create cloudflare@latest . --framework=next``
+- polygon client added with ``pnpm add @massive.com/client-js`` (Massive's docs use OpenAPI spec - chose this because the .ts support is better using polygon client)
+    - ``pnpm add axios``
+
 ---
 # env
 .env.local has:

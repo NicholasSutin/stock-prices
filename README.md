@@ -6,3 +6,5 @@
     - implement first in regular nextjs to understand and play around with APIs better
 - send to coudflare worker
 - read from cloudflare worker
+---
+created with ``pnpm create cloudflare@latest . --framework=next``

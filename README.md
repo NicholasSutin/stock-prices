@@ -4,7 +4,7 @@ API Providers (optimized for free tier)
 - Massive (polygon.io) for the ticker/symbol image
 ---
 - This is meant for eventual deployment on cloudflare, with opennext (nextjs) as the framework
-- Priority is ensuring every visitor doesn't call finnhub directly
+- Priority is ensuring every visitor doesn't call finnhub or polygon directly
     - visitors should still get relatively recent data across 10 tickers (used in this example)
 - optimized to be as low-cost as possible (free cloudflare services, free, though limited API usage)
 ---
@@ -21,19 +21,20 @@ API Providers (optimized for free tier)
 
 ---
 # env
-.env.local has:
+``workers/refresh-logos-cron/.dev.vars`` and ``.env.local`` have:
 ```env
 MASSIVE_API_KEY= # https://massive.com/dashboard
 ```
-
+(regular .env.local can be deleted later because we won't call anything from nextjs once the workers are properly architected)
 ---
 # Cloud changes
-R2 bucket ``logos-cache`` created
-Workers KV ``LOGO_META`` created
-Workers KV ``LOGO_META_preview`` created
+- R2 bucket ``logos-cache`` created
+- Workers KV ``LOGO_META`` created
+- Workers KV ``LOGO_META_preview`` created
 
 ---
 # notes
 ### in ``workers/refresh-logos-cron``
 - R2 remote CLI verification: ``pnpm dlx wrangler r2 object get logos-cache/test/scheduled.txt --remote``
 - KV preview mode CLI verification``pnpm dlx wrangler kv key get lastRun --binding LOGO_META --preview``
+- tested the worker with ``pnpm dlx wrangler dev --test-scheduled`` (wrangler cron was set to every 5 mins)

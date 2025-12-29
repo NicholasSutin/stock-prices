@@ -25,3 +25,15 @@ API Providers (optimized for free tier)
 ```env
 MASSIVE_API_KEY= # https://massive.com/dashboard
 ```
+
+---
+# Cloud changes
+R2 bucket ``logos-cache`` created
+Workers KV ``LOGO_META`` created
+Workers KV ``LOGO_META_preview`` created
+
+---
+# notes
+### in ``workers/refresh-logos-cron``
+- R2 remote CLI verification: ``pnpm dlx wrangler r2 object get logos-cache/test/scheduled.txt --remote``
+- KV preview mode CLI verification``pnpm dlx wrangler kv key get lastRun --binding LOGO_META --preview``

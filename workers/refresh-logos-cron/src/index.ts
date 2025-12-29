@@ -2,21 +2,14 @@ type Env = {
   LOGO_META: KVNamespace;
   LOGOS_CACHE: R2Bucket;
   MASSIVE_API_KEY: string;
+  ADMIN_TOKEN: string; // used to protect admin/debug endpoints
 };
 
 const TICKERS = ["META", "AAPL", "AMZN", "MSFT", "GOOGL"] as const;
 type Ticker = (typeof TICKERS)[number];
 
-type Branding = {
-  logo_url?: string;
-  icon_url?: string;
-};
-
-type TickerOverviewResponse = {
-  results?: {
-    branding?: Branding;
-  };
-};
+type Branding = { logo_url?: string; icon_url?: string };
+type TickerOverviewResponse = { results?: { branding?: Branding } };
 
 type StoredMeta = {
   ticker: Ticker;
@@ -34,9 +27,34 @@ type FetchedImage = {
   bytesBuf: Uint8Array;
 };
 
+const CURSOR_KEY = "cfg:cursor";
+const MAX_TICKERS_PER_RUN = 1; // dev-safe; increase later if you want
+const REFRESH_TTL_MS = 24 * 60 * 60 * 1000; // skip if updated within 24h
+
+class RateLimitError extends Error {
+  status: number;
+  retryAfter?: string | null;
+
+  constructor(message: string, status: number, retryAfter?: string | null) {
+    super(message);
+    this.name = "RateLimitError";
+    this.status = status;
+    this.retryAfter = retryAfter;
+  }
+}
+
+function requireAdmin(req: Request, env: Env): Response | null {
+  const auth = req.headers.get("authorization") || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : "";
+  if (!env.ADMIN_TOKEN || token !== env.ADMIN_TOKEN) {
+    return new Response("forbidden", { status: 403 });
+  }
+  return null;
+}
+
 export default {
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
-    ctx.waitUntil(refreshAll(env));
+    ctx.waitUntil(refreshBatch(env));
   },
 
   async fetch(req: Request, env: Env, ctx: ExecutionContext) {
@@ -48,53 +66,152 @@ export default {
     }
 
     if (url.pathname === "/status") {
+      const forbidden = requireAdmin(req, env);
+      if (forbidden) return forbidden;
+
       const lastRun = await env.LOGO_META.get("lastRun");
+      const lastRunResult = await env.LOGO_META.get("lastRunResult", "json");
       const keys = await env.LOGO_META.list({ prefix: "ticker:" });
+
       return Response.json({
         tickers: TICKERS,
         lastRun,
+        lastRunResult,
         cachedTickers: keys.keys.map((k) => k.name),
       });
     }
 
     if (url.pathname === "/run") {
-      ctx.waitUntil(refreshAll(env));
+      const forbidden = requireAdmin(req, env);
+      if (forbidden) return forbidden;
+
+      ctx.waitUntil(refreshBatch(env));
       return new Response("queued");
     }
 
     if (url.pathname.startsWith("/meta/")) {
+      const forbidden = requireAdmin(req, env);
+      if (forbidden) return forbidden;
+
       const ticker = url.pathname.split("/").pop()?.toUpperCase() as Ticker | undefined;
       if (!ticker || !TICKERS.includes(ticker)) return new Response("unknown ticker", { status: 400 });
 
       const meta = await env.LOGO_META.get(`ticker:${ticker}`);
-      return meta ? new Response(meta, { headers: { "Content-Type": "application/json" } }) : new Response("not found", { status: 404 });
+      return meta
+        ? new Response(meta, { headers: { "Content-Type": "application/json" } })
+        : new Response("not found", { status: 404 });
+    }
+
+    // Public: serve cached bytes (browser can cache; no Massive calls)
+    if (url.pathname.startsWith("/logo/")) {
+      const ticker = url.pathname.split("/").pop()?.toUpperCase() as Ticker | undefined;
+      if (!ticker || !TICKERS.includes(ticker)) return new Response("unknown ticker", { status: 400 });
+
+      const meta = (await env.LOGO_META.get(`ticker:${ticker}`, "json")) as StoredMeta | null;
+      if (!meta) return new Response("not found", { status: 404 });
+
+      const obj = await env.LOGOS_CACHE.get(meta.key);
+      if (!obj || !obj.body) return new Response("not found", { status: 404 });
+
+      // Simple ETag that changes when meta.updated_at changes
+      const etag = `"${meta.updated_at}"`;
+      const inm = req.headers.get("if-none-match");
+      if (inm && inm === etag) return new Response(null, { status: 304 });
+
+      return new Response(obj.body, {
+        headers: {
+          "Content-Type": meta.mime,
+          "Cache-Control": "public, max-age=86400",
+          ETag: etag,
+        },
+      });
     }
 
     return new Response("not found", { status: 404 });
   },
 };
 
-async function refreshAll(env: Env) {
+async function refreshBatch(env: Env) {
   const ts = new Date().toISOString();
   console.log("[cron] start", ts);
   console.log("Secret:", env.MASSIVE_API_KEY ? "✅ loaded" : "❌ missing");
 
-  const results: Array<{ ticker: Ticker; ok: boolean; error?: string; key?: string }> = [];
+  const results: Array<{
+    ticker: Ticker;
+    ok: boolean;
+    error?: string;
+    key?: string;
+    status?: number;
+    retryAfter?: string | null;
+  }> = [];
 
-  for (const ticker of TICKERS) {
+  // cursor-based batching
+  const rawCursor = await env.LOGO_META.get(CURSOR_KEY);
+  let cursor = Number.parseInt(rawCursor ?? "0", 10);
+  if (!Number.isFinite(cursor) || cursor < 0) cursor = 0;
+
+  const batch: Ticker[] = [];
+  for (let i = 0; i < Math.min(MAX_TICKERS_PER_RUN, TICKERS.length); i++) {
+    batch.push(TICKERS[(cursor + i) % TICKERS.length]);
+  }
+
+  const nextCursor = (cursor + batch.length) % TICKERS.length;
+  await env.LOGO_META.put(CURSOR_KEY, String(nextCursor));
+
+  for (const ticker of batch) {
     try {
+      // freshness skip
+      const existing = (await env.LOGO_META.get(`ticker:${ticker}`, "json")) as StoredMeta | null;
+      if (existing) {
+        const age = Date.now() - Date.parse(existing.updated_at);
+        if (Number.isFinite(age) && age >= 0 && age < REFRESH_TTL_MS) {
+          results.push({ ticker, ok: true, key: existing.key });
+          await env.LOGO_META.put(
+            `ticker:${ticker}:result`,
+            JSON.stringify({ ok: true, step: "skip_fresh", updated_at: ts })
+          );
+          console.log(`[cron] ⏭️ ${ticker} fresh -> ${existing.key}`);
+          continue;
+        }
+      }
+
       const meta = await refreshOneTicker(ticker, env);
       results.push({ ticker, ok: true, key: meta.key });
+      await env.LOGO_META.put(
+        `ticker:${ticker}:result`,
+        JSON.stringify({ ok: true, step: "updated", key: meta.key, updated_at: ts })
+      );
       console.log(`[cron] ✅ ${ticker} -> ${meta.key}`);
     } catch (e: unknown) {
+      if (e instanceof RateLimitError) {
+        results.push({ ticker, ok: false, error: e.message, status: e.status, retryAfter: e.retryAfter });
+        await env.LOGO_META.put(
+          `ticker:${ticker}:result`,
+          JSON.stringify({
+            ok: false,
+            step: "rate_limited",
+            status: e.status,
+            retryAfter: e.retryAfter,
+            error: e.message,
+            updated_at: ts,
+          })
+        );
+        console.log(`[cron] 🛑 ${ticker}: ${e.message} (retry-after=${e.retryAfter ?? "n/a"})`);
+        break; // stop early if throttled
+      }
+
       const msg = e instanceof Error ? e.message : "Unknown error";
       results.push({ ticker, ok: false, error: msg });
+      await env.LOGO_META.put(
+        `ticker:${ticker}:result`,
+        JSON.stringify({ ok: false, step: "error", error: msg, updated_at: ts })
+      );
       console.log(`[cron] ❌ ${ticker}: ${msg}`);
     }
   }
 
   await env.LOGO_META.put("lastRun", ts);
-  await env.LOGO_META.put("lastRunResult", JSON.stringify({ ts, results }));
+  await env.LOGO_META.put("lastRunResult", JSON.stringify({ ts, batch, results }));
   console.log("[cron] done");
 }
 
@@ -104,6 +221,10 @@ async function refreshOneTicker(ticker: Ticker, env: Env): Promise<StoredMeta> {
   // 1) Get branding URLs
   const overviewUrl = `https://api.massive.com/v3/reference/tickers/${ticker}?apiKey=${apiKey}`;
   const overviewRes = await fetch(overviewUrl);
+
+  if (overviewRes.status === 429) {
+    throw new RateLimitError("Ticker overview failed (429)", 429, overviewRes.headers.get("retry-after"));
+  }
   if (!overviewRes.ok) throw new Error(`Ticker overview failed (${overviewRes.status})`);
 
   const overviewJson = (await overviewRes.json()) as TickerOverviewResponse;
@@ -142,12 +263,15 @@ async function refreshOneTicker(ticker: Ticker, env: Env): Promise<StoredMeta> {
   };
 
   await env.LOGO_META.put(`ticker:${ticker}`, JSON.stringify(meta));
-
   return meta;
 }
 
 async function fetchImageBytes(url: string): Promise<FetchedImage | null> {
   const res = await fetch(url);
+
+  if (res.status === 429) {
+    throw new RateLimitError("Image fetch failed (429)", 429, res.headers.get("retry-after"));
+  }
   if (!res.ok) return null;
 
   const mime = res.headers.get("content-type") || inferMimeFromUrl(url);

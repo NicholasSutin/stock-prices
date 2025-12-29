@@ -21,11 +21,11 @@ API Providers (optimized for free tier)
 
 ---
 # env
-``workers/refresh-logos-cron/.dev.vars`` and ``.env.local`` have:
+``workers/refresh-logos-cron/.dev.vars`` has:
 ```env
 MASSIVE_API_KEY= # https://massive.com/dashboard
+ADMIN_TOKEN= # Super long random token you make up
 ```
-(regular .env.local can be deleted later because we won't call anything from nextjs once the workers are properly architected)
 ---
 # Cloud changes
 - R2 bucket ``logos-cache`` created

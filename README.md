@@ -21,6 +21,6 @@ Massive install ``pnpm install --save '@massive.com/client-js'`` (didn't work)
 ---
 # env
 .env.local has:
-```
+```env
 MASSIVE_API_KEY= # https://massive.com/dashboard
 ```

@@ -9,7 +9,7 @@ type StoredMeta = {
 };
 
 export async function GET(req: Request) {
-  const { env } = getCloudflareContext();
+  const { env } = await getCloudflareContext({ async: true });
 
   const tickers = (await env.LOGO_META.get("cfg:tickers", "json")) as string[] | null;
   if (!tickers || tickers.length === 0) {

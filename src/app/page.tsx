@@ -1,39 +1,13 @@
-import { headers } from "next/headers";
+import { Suspense } from "react";
+import Logos from "@/components/logos";
 
-type Logo = { ticker: string; dataUri: string; updated_at: string; mime: string; bytes: number };
-type LogosResponse = { lastRun: string | null; logos: Logo[] };
-
-export default async function Home() {
-  const h = await headers();
-  const host = h.get("host");
-  const proto = h.get("x-forwarded-proto") ?? "http";
-
-  if (!host) {
-    return <div>Missing host header</div>;
-  }
-
-  const res = await fetch(`${proto}://${host}/api/logos`, { cache: "no-store" });
-
-  if (!res.ok) {
-    const text = await res.text();
-    return (
-      <div>
-        <div>Failed to load /api/logos: {res.status}</div>
-        <pre style={{ whiteSpace: "pre-wrap" }}>{text}</pre>
-      </div>
-    );
-  }
-
-  const data = (await res.json()) as LogosResponse;
-
+export default function Home() {
   return (
     <div>
-      {data.logos.map((l) => (
-        <div key={l.ticker}>
-          <div>{l.ticker}</div>
-          <img src={l.dataUri} alt={l.ticker} width={32} height={32} />
-        </div>
-      ))}
+      <p>page.tsx</p>
+      <Suspense fallback={<div>Loading logos…</div>}>
+        <Logos />
+      </Suspense>
     </div>
   );
 }

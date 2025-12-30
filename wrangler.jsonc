@@ -35,13 +35,21 @@
 	"observability": {
 		"enabled": true
 	},
+	"kv_namespaces": [
+		{
+		"binding": "LOGO_META",
+		"id": "e35a391927e3461e8fae047ae6fde2fe",
+		"preview_id": "239b142b2f6b419da550046c9633d1db"
+		}
+	],
+
 	"r2_buckets": [
 		{
-			"bucket_name": "logos-cache",
-			"binding": "logos_cache",
-			"remote": true
+		"bucket_name": "logos-cache",
+		"binding": "LOGOS_CACHE",
+		"remote": true
 		}
-	]
+	],
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement

@@ -28,8 +28,15 @@ type FetchedImage = {
 };
 
 const CURSOR_KEY = "cfg:cursor";
-const MAX_TICKERS_PER_RUN = 1; // dev-safe
+const BLOCKED_UNTIL_KEY = "cfg:blockedUntil";
+const CYCLE_ACTIVE_UNTIL_KEY = "cfg:cycleActiveUntil";
+const LAST_MINUTE_RUN_KEY = "cfg:lastMinuteRun";
+
 const REFRESH_TTL_MS = 24 * 60 * 60 * 1000;
+
+// Must match wrangler.jsonc exactly if you want “start cycle” logic.
+const DAILY_CRON = "30 14 * * *"; // 9:30 EST in UTC
+const MINUTE_CRON = "* * * * *";
 
 class RateLimitError extends Error {
   status: number;
@@ -58,9 +65,51 @@ function parseTickerFromPath(pathname: string, prefix: string): Ticker | null {
   return TICKERS.includes(t) ? t : null;
 }
 
+function parseRetryAfterMs(retryAfter: string | null | undefined): number | null {
+  if (!retryAfter) return null;
+  const sec = Number(retryAfter);
+  if (Number.isFinite(sec) && sec > 0) return Math.floor(sec * 1000);
+
+  const dateMs = Date.parse(retryAfter);
+  if (Number.isFinite(dateMs)) {
+    const ms = dateMs - Date.now();
+    return ms > 0 ? ms : null;
+  }
+  return null;
+}
+
+async function getNumberKV(env: Env, key: string): Promise<number | null> {
+  const raw = await env.LOGO_META.get(key);
+  if (!raw) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+async function setNumberKV(env: Env, key: string, value: number) {
+  await env.LOGO_META.put(key, String(value));
+}
+
+async function clearKV(env: Env, key: string) {
+  await env.LOGO_META.delete(key);
+}
+
 export default {
-  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
-    ctx.waitUntil(refreshBatch(env));
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
+    // 1) Daily cron: arm a “cycle window” and reset cursor.
+    if (event.cron === DAILY_CRON) {
+      ctx.waitUntil(startCycle(env));
+      return;
+    }
+
+    // 2) Every-minute cron: do at most one ticker per minute while cycle is active.
+    // (If you only configure one cron, it will still work: it will just no-op unless active.)
+    if (event.cron === MINUTE_CRON) {
+      ctx.waitUntil(runMinute(env));
+      return;
+    }
+
+    // Fallback: treat unknown cron as minute runner
+    ctx.waitUntil(runMinute(env));
   },
 
   async fetch(req: Request, env: Env, ctx: ExecutionContext) {
@@ -78,21 +127,37 @@ export default {
       const lastRun = await env.LOGO_META.get("lastRun");
       const lastRunResult = await env.LOGO_META.get("lastRunResult", "json");
       const keys = await env.LOGO_META.list({ prefix: "ticker:" });
+      const cursor = await env.LOGO_META.get(CURSOR_KEY);
+      const blockedUntil = await env.LOGO_META.get(BLOCKED_UNTIL_KEY);
+      const cycleActiveUntil = await env.LOGO_META.get(CYCLE_ACTIVE_UNTIL_KEY);
 
       return Response.json({
         tickers: TICKERS,
+        cursor,
+        blockedUntil,
+        cycleActiveUntil,
         lastRun,
         lastRunResult,
         cachedTickers: keys.keys.map((k) => k.name),
       });
     }
 
-    if (url.pathname === "/run") {
+    // Admin: manually start a cycle now (useful in dev; not needed in production)
+    if (url.pathname === "/start") {
       const forbidden = requireAdmin(req, env);
       if (forbidden) return forbidden;
 
-      ctx.waitUntil(refreshBatch(env));
-      return new Response("queued");
+      ctx.waitUntil(startCycle(env));
+      return new Response("cycle started");
+    }
+
+    // Admin: manually run one minute “tick” now
+    if (url.pathname === "/tick") {
+      const forbidden = requireAdmin(req, env);
+      if (forbidden) return forbidden;
+
+      ctx.waitUntil(runMinute(env));
+      return new Response("tick queued");
     }
 
     if (url.pathname.startsWith("/meta/")) {
@@ -136,13 +201,60 @@ export default {
   },
 };
 
-async function refreshBatch(env: Env) {
-  const ts = new Date().toISOString();
-  console.log("[cron] start", ts);
-  console.log("Secret:", env.MASSIVE_API_KEY ? "✅ loaded" : "❌ missing");
-
-  // Make ticker list available to Next.js (single source of truth is Worker)
+async function startCycle(env: Env) {
+  // publish tickers list for Next.js
   await env.LOGO_META.put("cfg:tickers", JSON.stringify(TICKERS));
+
+  // reset cursor so the cycle is deterministic
+  await env.LOGO_META.put(CURSOR_KEY, "0");
+
+  // clear any previous block so we attempt again today
+  await clearKV(env, BLOCKED_UNTIL_KEY);
+
+  // keep the cycle “active” long enough to do 1 ticker/minute for all tickers + a little buffer
+  const bufferMs = 2 * 60 * 1000;
+  const activeForMs = TICKERS.length * 60 * 1000 + bufferMs;
+  await setNumberKV(env, CYCLE_ACTIVE_UNTIL_KEY, Date.now() + activeForMs);
+
+  console.log("[cycle] started", { activeForMs, tickers: TICKERS.length });
+}
+
+async function runMinute(env: Env) {
+  // only do work when a cycle is active
+  const activeUntil = (await getNumberKV(env, CYCLE_ACTIVE_UNTIL_KEY)) ?? 0;
+  if (!activeUntil || Date.now() > activeUntil) return;
+
+  // enforce “at most once per minute” even if cron overlaps
+  const lastMinute = (await getNumberKV(env, LAST_MINUTE_RUN_KEY)) ?? 0;
+  if (Date.now() - lastMinute < 55_000) return;
+  await setNumberKV(env, LAST_MINUTE_RUN_KEY, Date.now());
+
+  // respect upstream rate limiting
+  const blockedUntil = (await getNumberKV(env, BLOCKED_UNTIL_KEY)) ?? 0;
+  if (blockedUntil && Date.now() < blockedUntil) return;
+
+  // process exactly one ticker
+  await refreshOneFromCursor(env);
+
+  // if we wrapped cursor back to 0, the cycle is complete; turn off “active”
+  const curRaw = await env.LOGO_META.get(CURSOR_KEY);
+  const cur = Number.parseInt(curRaw ?? "0", 10);
+  if (Number.isFinite(cur) && cur === 0) {
+    await clearKV(env, CYCLE_ACTIVE_UNTIL_KEY);
+    console.log("[cycle] complete");
+  }
+}
+
+async function refreshOneFromCursor(env: Env) {
+  const ts = new Date().toISOString();
+  console.log("[cron] tick", ts);
+
+  await env.LOGO_META.put("cfg:tickers", JSON.stringify(TICKERS));
+
+  let cursor = Number.parseInt((await env.LOGO_META.get(CURSOR_KEY)) ?? "0", 10);
+  if (!Number.isFinite(cursor) || cursor < 0) cursor = 0;
+
+  const ticker = TICKERS[cursor % TICKERS.length];
 
   const results: Array<{
     ticker: Ticker;
@@ -151,68 +263,75 @@ async function refreshBatch(env: Env) {
     key?: string;
     status?: number;
     retryAfter?: string | null;
+    step?: string;
   }> = [];
 
-  // cursor-based batching
-  const rawCursor = await env.LOGO_META.get(CURSOR_KEY);
-  let cursor = Number.parseInt(rawCursor ?? "0", 10);
-  if (!Number.isFinite(cursor) || cursor < 0) cursor = 0;
+  try {
+    const existing = (await env.LOGO_META.get(`ticker:${ticker}`, "json")) as StoredMeta | null;
+    if (existing) {
+      const age = Date.now() - Date.parse(existing.updated_at);
+      if (Number.isFinite(age) && age >= 0 && age < REFRESH_TTL_MS) {
+        results.push({ ticker, ok: true, key: existing.key, step: "skip_fresh" });
+        await env.LOGO_META.put(
+          `ticker:${ticker}:result`,
+          JSON.stringify({ ok: true, step: "skip_fresh", updated_at: ts })
+        );
+        console.log(`[cron] ⏭️ ${ticker} fresh -> ${existing.key}`);
+        // advance cursor even if fresh
+        await env.LOGO_META.put(CURSOR_KEY, String((cursor + 1) % TICKERS.length));
+      } else {
+        const meta = await refreshOneTicker(ticker, env);
+        results.push({ ticker, ok: true, key: meta.key, step: "updated" });
 
-  const batch: Ticker[] = [];
-  for (let i = 0; i < Math.min(MAX_TICKERS_PER_RUN, TICKERS.length); i++) {
-    batch.push(TICKERS[(cursor + i) % TICKERS.length]);
-  }
+        await env.LOGO_META.put(
+          `ticker:${ticker}:result`,
+          JSON.stringify({ ok: true, step: "updated", key: meta.key, updated_at: ts })
+        );
+        console.log(`[cron] ✅ ${ticker} -> ${meta.key}`);
 
-  const nextCursor = (cursor + batch.length) % TICKERS.length;
-  await env.LOGO_META.put(CURSOR_KEY, String(nextCursor));
-
-  for (const ticker of batch) {
-    try {
-      // freshness skip
-      const existing = (await env.LOGO_META.get(`ticker:${ticker}`, "json")) as StoredMeta | null;
-      if (existing) {
-        const age = Date.now() - Date.parse(existing.updated_at);
-        if (Number.isFinite(age) && age >= 0 && age < REFRESH_TTL_MS) {
-          results.push({ ticker, ok: true, key: existing.key });
-          await env.LOGO_META.put(
-            `ticker:${ticker}:result`,
-            JSON.stringify({ ok: true, step: "skip_fresh", updated_at: ts })
-          );
-          console.log(`[cron] ⏭️ ${ticker} fresh -> ${existing.key}`);
-          continue;
-        }
+        await env.LOGO_META.put(CURSOR_KEY, String((cursor + 1) % TICKERS.length));
       }
-
+    } else {
       const meta = await refreshOneTicker(ticker, env);
-      results.push({ ticker, ok: true, key: meta.key });
+      results.push({ ticker, ok: true, key: meta.key, step: "updated" });
 
       await env.LOGO_META.put(
         `ticker:${ticker}:result`,
         JSON.stringify({ ok: true, step: "updated", key: meta.key, updated_at: ts })
       );
       console.log(`[cron] ✅ ${ticker} -> ${meta.key}`);
-    } catch (e: unknown) {
-      if (e instanceof RateLimitError) {
-        results.push({ ticker, ok: false, error: e.message, status: e.status, retryAfter: e.retryAfter });
 
-        await env.LOGO_META.put(
-          `ticker:${ticker}:result`,
-          JSON.stringify({
-            ok: false,
-            step: "rate_limited",
-            status: e.status,
-            retryAfter: e.retryAfter,
-            error: e.message,
-            updated_at: ts,
-          })
-        );
+      await env.LOGO_META.put(CURSOR_KEY, String((cursor + 1) % TICKERS.length));
+    }
+  } catch (e: unknown) {
+    if (e instanceof RateLimitError) {
+      const delayMs = parseRetryAfterMs(e.retryAfter) ?? 60_000; // fallback: 1 minute
+      const until = Date.now() + delayMs;
 
-        console.log(`[cron] 🛑 ${ticker}: ${e.message} (retry-after=${e.retryAfter ?? "n/a"})`);
-        break; // stop early if throttled
-      }
+      await setNumberKV(env, BLOCKED_UNTIL_KEY, until);
 
+      // extend cycle window so it can continue after backoff
+      const activeUntil = (await getNumberKV(env, CYCLE_ACTIVE_UNTIL_KEY)) ?? 0;
+      if (activeUntil) await setNumberKV(env, CYCLE_ACTIVE_UNTIL_KEY, activeUntil + delayMs);
+
+      results.push({ ticker, ok: false, error: e.message, status: e.status, retryAfter: e.retryAfter, step: "rate_limited" });
+
+      await env.LOGO_META.put(
+        `ticker:${ticker}:result`,
+        JSON.stringify({
+          ok: false,
+          step: "rate_limited",
+          status: e.status,
+          retryAfter: e.retryAfter,
+          error: e.message,
+          updated_at: ts,
+        })
+      );
+
+      console.log(`[cron] 🛑 ${ticker}: ${e.message} (retry-after=${e.retryAfter ?? "n/a"})`);
+    } else {
       const msg = e instanceof Error ? e.message : "Unknown error";
-      results.push({ ticker, ok: false, error: msg });
+      results.push({ ticker, ok: false, error: msg, step: "error" });
 
       await env.LOGO_META.put(
         `ticker:${ticker}:result`,
@@ -220,12 +339,14 @@ async function refreshBatch(env: Env) {
       );
 
       console.log(`[cron] ❌ ${ticker}: ${msg}`);
+
+      // advance cursor on non-rate-limit errors to avoid getting stuck
+      await env.LOGO_META.put(CURSOR_KEY, String((cursor + 1) % TICKERS.length));
     }
   }
 
   await env.LOGO_META.put("lastRun", ts);
-  await env.LOGO_META.put("lastRunResult", JSON.stringify({ ts, batch, results }));
-  console.log("[cron] done");
+  await env.LOGO_META.put("lastRunResult", JSON.stringify({ ts, batch: [ticker], results }));
 }
 
 async function refreshOneTicker(ticker: Ticker, env: Env): Promise<StoredMeta> {

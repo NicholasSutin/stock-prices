@@ -34,7 +34,7 @@ LOGO_WORKER_ADMIN_TOKEN= # some-long-random-string
 # Cloud changes
 - R2 bucket ``logos-cache`` created
 - Workers KV ``LOGO_META`` created
-- Workers KV ``LOGO_META_preview`` created
+- Workers KV ``LOGO_META_preview`` created (disconnected now & not used)
 
 ---
 # notes
@@ -42,5 +42,5 @@ LOGO_WORKER_ADMIN_TOKEN= # some-long-random-string
 - R2 remote CLI verification: ``pnpm dlx wrangler r2 object get logos-cache/test/scheduled.txt --remote``
 - KV preview mode CLI verification``pnpm dlx wrangler kv key get lastRun --binding LOGO_META --preview``
 - tested the worker with ``pnpm dlx wrangler dev --test-scheduled`` (wrangler cron was set to every 5 mins)
-    - hit (http://localhost:8787/__scheduled)[http://localhost:8787/__scheduled] to start running the original worker to get images
+    - hit [http://localhost:8787/__scheduled](http://localhost:8787/__scheduled) to start running the original worker to get images
 - had to do ``pnpm dlx wrangler types --config ./wrangler.jsonc --env-interface CloudflareEnv ./cloudflare-env.d.ts`` for the ``src/app/api/logo/[ticker]/route.ts`` to not return cf TS errors, and for ``cloudflare-env.d.ts`` to include ``LOGO_META: KVNamespace`` and ``LOGOS_CACHE: R2Bucket``

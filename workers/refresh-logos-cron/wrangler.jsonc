@@ -16,7 +16,7 @@
             "remote": true 
         }
     ],
-    "triggers": { 
-        //"crons": ["30 14 * * *"] }        9:30 EST
-        "crons": ["*/5 * * * *"] } //every 5 mins
+    "triggers": {
+        "triggers": { "crons": ["* * * * *"] } // this means the worker restarts every single minute - may change later
+    }
 }

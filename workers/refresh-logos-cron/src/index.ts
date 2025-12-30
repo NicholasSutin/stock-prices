@@ -2,7 +2,7 @@ type Env = {
   LOGO_META: KVNamespace;
   LOGOS_CACHE: R2Bucket;
   MASSIVE_API_KEY: string;
-  ADMIN_TOKEN: string; // used to protect admin/debug endpoints
+  ADMIN_TOKEN: string;
 };
 
 const TICKERS = ["META", "AAPL", "AMZN", "MSFT", "GOOGL"] as const;
@@ -28,8 +28,8 @@ type FetchedImage = {
 };
 
 const CURSOR_KEY = "cfg:cursor";
-const MAX_TICKERS_PER_RUN = 1; // dev-safe; increase later if you want
-const REFRESH_TTL_MS = 24 * 60 * 60 * 1000; // skip if updated within 24h
+const MAX_TICKERS_PER_RUN = 1; // dev-safe
+const REFRESH_TTL_MS = 24 * 60 * 60 * 1000;
 
 class RateLimitError extends Error {
   status: number;
@@ -50,6 +50,12 @@ function requireAdmin(req: Request, env: Env): Response | null {
     return new Response("forbidden", { status: 403 });
   }
   return null;
+}
+
+function parseTickerFromPath(pathname: string, prefix: string): Ticker | null {
+  const raw = pathname.slice(prefix.length).replace(/^\/+/, "").toUpperCase();
+  const t = raw as Ticker;
+  return TICKERS.includes(t) ? t : null;
 }
 
 export default {
@@ -93,8 +99,8 @@ export default {
       const forbidden = requireAdmin(req, env);
       if (forbidden) return forbidden;
 
-      const ticker = url.pathname.split("/").pop()?.toUpperCase() as Ticker | undefined;
-      if (!ticker || !TICKERS.includes(ticker)) return new Response("unknown ticker", { status: 400 });
+      const ticker = parseTickerFromPath(url.pathname, "/meta/");
+      if (!ticker) return new Response("unknown ticker", { status: 400 });
 
       const meta = await env.LOGO_META.get(`ticker:${ticker}`);
       return meta
@@ -102,10 +108,10 @@ export default {
         : new Response("not found", { status: 404 });
     }
 
-    // Public: serve cached bytes (browser can cache; no Massive calls)
+    // Public: serve cached bytes (no Massive calls)
     if (url.pathname.startsWith("/logo/")) {
-      const ticker = url.pathname.split("/").pop()?.toUpperCase() as Ticker | undefined;
-      if (!ticker || !TICKERS.includes(ticker)) return new Response("unknown ticker", { status: 400 });
+      const ticker = parseTickerFromPath(url.pathname, "/logo/");
+      if (!ticker) return new Response("unknown ticker", { status: 400 });
 
       const meta = (await env.LOGO_META.get(`ticker:${ticker}`, "json")) as StoredMeta | null;
       if (!meta) return new Response("not found", { status: 404 });
@@ -113,7 +119,6 @@ export default {
       const obj = await env.LOGOS_CACHE.get(meta.key);
       if (!obj || !obj.body) return new Response("not found", { status: 404 });
 
-      // Simple ETag that changes when meta.updated_at changes
       const etag = `"${meta.updated_at}"`;
       const inm = req.headers.get("if-none-match");
       if (inm && inm === etag) return new Response(null, { status: 304 });
@@ -135,6 +140,9 @@ async function refreshBatch(env: Env) {
   const ts = new Date().toISOString();
   console.log("[cron] start", ts);
   console.log("Secret:", env.MASSIVE_API_KEY ? "✅ loaded" : "❌ missing");
+
+  // Make ticker list available to Next.js (single source of truth is Worker)
+  await env.LOGO_META.put("cfg:tickers", JSON.stringify(TICKERS));
 
   const results: Array<{
     ticker: Ticker;
@@ -177,6 +185,7 @@ async function refreshBatch(env: Env) {
 
       const meta = await refreshOneTicker(ticker, env);
       results.push({ ticker, ok: true, key: meta.key });
+
       await env.LOGO_META.put(
         `ticker:${ticker}:result`,
         JSON.stringify({ ok: true, step: "updated", key: meta.key, updated_at: ts })
@@ -185,6 +194,7 @@ async function refreshBatch(env: Env) {
     } catch (e: unknown) {
       if (e instanceof RateLimitError) {
         results.push({ ticker, ok: false, error: e.message, status: e.status, retryAfter: e.retryAfter });
+
         await env.LOGO_META.put(
           `ticker:${ticker}:result`,
           JSON.stringify({
@@ -196,16 +206,19 @@ async function refreshBatch(env: Env) {
             updated_at: ts,
           })
         );
+
         console.log(`[cron] 🛑 ${ticker}: ${e.message} (retry-after=${e.retryAfter ?? "n/a"})`);
         break; // stop early if throttled
       }
 
       const msg = e instanceof Error ? e.message : "Unknown error";
       results.push({ ticker, ok: false, error: msg });
+
       await env.LOGO_META.put(
         `ticker:${ticker}:result`,
         JSON.stringify({ ok: false, step: "error", error: msg, updated_at: ts })
       );
+
       console.log(`[cron] ❌ ${ticker}: ${msg}`);
     }
   }
@@ -218,7 +231,6 @@ async function refreshBatch(env: Env) {
 async function refreshOneTicker(ticker: Ticker, env: Env): Promise<StoredMeta> {
   const apiKey = env.MASSIVE_API_KEY;
 
-  // 1) Get branding URLs
   const overviewUrl = `https://api.massive.com/v3/reference/tickers/${ticker}?apiKey=${apiKey}`;
   const overviewRes = await fetch(overviewUrl);
 
@@ -235,7 +247,6 @@ async function refreshOneTicker(ticker: Ticker, env: Env): Promise<StoredMeta> {
 
   if (!logoUrl && !iconUrl) throw new Error("No branding.logo_url or branding.icon_url");
 
-  // 2) Fetch both (if present) and choose smaller by bytes
   const [logo, icon] = await Promise.all([
     logoUrl ? fetchImageBytes(logoUrl) : Promise.resolve(null),
     iconUrl ? fetchImageBytes(iconUrl) : Promise.resolve(null),
@@ -244,7 +255,6 @@ async function refreshOneTicker(ticker: Ticker, env: Env): Promise<StoredMeta> {
   const chosen = chooseSmaller(logo, icon);
   if (!chosen) throw new Error("Both logo/icon fetch failed");
 
-  // 3) Store bytes in R2 (raw, not data URI)
   const ext = mimeToExt(chosen.mime, chosen.url);
   const key = `logos/${ticker}.${ext}`;
 
@@ -252,7 +262,6 @@ async function refreshOneTicker(ticker: Ticker, env: Env): Promise<StoredMeta> {
     httpMetadata: { contentType: chosen.mime },
   });
 
-  // 4) Store metadata in KV
   const meta: StoredMeta = {
     ticker,
     key,
@@ -300,7 +309,6 @@ function mimeToExt(mime: string, url: string): string {
   if (m.includes("png")) return "png";
   if (m.includes("jpeg") || m.includes("jpg")) return "jpg";
 
-  // fallback if content-type is missing/odd
   const lower = url.toLowerCase();
   if (lower.includes(".svg")) return "svg";
   if (lower.includes(".png")) return "png";

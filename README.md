@@ -44,6 +44,7 @@ LOGO_WORKER_ADMIN_TOKEN= # some-long-random-string
 - tested the worker with ``pnpm dlx wrangler dev --test-scheduled`` (wrangler cron was set to every 5 mins)
 - had to do ``pnpm dlx wrangler types --config ./wrangler.jsonc --env-interface CloudflareEnv ./cloudflare-env.d.ts`` for the ``src/app/api/logo/[ticker]/route.ts`` to not return cf TS errors, and for ``cloudflare-env.d.ts`` to include ``LOGO_META: KVNamespace`` and ``LOGOS_CACHE: R2Bucket``
 
+---
 # continue at https://www.perplexity.ai/search/my-cloudflare-dashboard-r2-ove-D4bo1julTkGAIDJxvrH54Q, 
 - we're going to remove the [slug] and modify the KV. intent: receive all data defined in the worker, so the client/nextjs never even makes a request to fetch anything specific. 
 - receive a predefined watchlist from the worker 

@@ -2,8 +2,7 @@
 
 A Next.js (App Router) project intended for deployment to Cloudflare Workers using the OpenNext adapter, with a separate cron Worker that pre-fetches and caches ticker logos so visitors never call Massive/Polygon directly.
 
-## API providers (free-tier oriented)
-- Finnhub: real-time stock quotes (planned / not yet implemented in the code shown below).
+## API provider (free-tier oriented)
 - Massive (Polygon.io): company branding images (logo/icon) for tickers (implemented).
 
 ## High-level architecture
@@ -32,12 +31,8 @@ Worker HTTP endpoints:
   - corresponding image bytes from R2 using the stored `key`
 - It returns a JSON payload of logos as `data:` URIs (base64) to keep the browser from needing direct R2 access.
 
-## Goals (current vs planned)
 ### Implemented now
 - Cache ticker logos in R2 + store metadata in KV so clients never call Massive directly.
-
-### Planned / TODO
-- A quotes refresher that calls Finnhub on a controlled schedule, stores quote data in KV, and has Next.js read from KV on a short revalidation interval (e.g., ~5–10 seconds) so clients never call Finnhub directly.
 
 ## Setup / commands
 ### Created with
